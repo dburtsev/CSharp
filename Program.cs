@@ -19,7 +19,7 @@ namespace sqltoaws
 {
     class Program
     {
-        static string MSSQLConnStr = "Provider=MSOLEDBSQL;Server=xyz;Database=TEST;UID=xyz;PWD=xyz";
+        static string MSSQLConnStr = "Provider=MSOLEDBSQL;Database=xyz;Trusted_Connection=yes;";
         static string RedshiftConnStr = "DRIVER=Amazon Redshift (x64);Server=xyz.redshift.amazonaws.com;Database=xyz;UID=xyz;pwd=xyz;Port=5439";
         static string bucketName = "";
         static string keyName = "";
@@ -44,7 +44,8 @@ namespace sqltoaws
             // do we have schema?
             if (FullTableName.IndexOf('.') == -1 )
             { FullTableName = String.Concat("dbo.", FullTableName); }
-           
+
+            
             setVariables();
             s3Client = new AmazonS3Client(bucketRegion);
 
@@ -71,8 +72,9 @@ namespace sqltoaws
             var decArray = new decimal?[] { };
             var dblArray = new double?[] { };
             var singlArray = new Single?[] { };
+            var byteArray = new Byte?[] { };
             Dictionary<string, int> scales = new Dictionary<string, int>();
-
+            //if (String.IsNullOrWhiteSpace(FullTableName)) { FullTableName = "dbo.new_line"; }
             int dotPos = FullTableName.IndexOf(".", 0, FullTableName.Length, StringComparison.CurrentCulture);
             schemaName = FullTableName.Substring(0, dotPos);
             tblName = FullTableName.Substring(dotPos + 1);
@@ -90,9 +92,10 @@ namespace sqltoaws
             (
             SELECT CASE
             WHEN DATA_TYPE IN('date', 'datetime', 'datetimeoffset') THEN 'CAST(' + COLUMN_NAME + ' AS DATETIME2) AS ' + COLUMN_NAME
-            WHEN DATA_TYPE IN('varchar', 'nvarchar', 'xml') AND CHARACTER_MAXIMUM_LENGTH = -1 THEN '((CAST(ISNULL(' + COLUMN_NAME + ','''') AS VARCHAR(65534)) + '' '') COLLATE Cyrillic_General_CI_AI) COLLATE SQL_Latin1_General_CP1_CI_AI) AS ' + COLUMN_NAME
+            WHEN DATA_TYPE IN('varchar', 'nvarchar', 'xml') AND (CHARACTER_MAXIMUM_LENGTH = -1 OR CHARACTER_MAXIMUM_LENGTH > 65535) THEN '((CAST(ISNULL(' + COLUMN_NAME + ','''') AS VARCHAR(65535))) COLLATE Cyrillic_General_CI_AI) COLLATE SQL_Latin1_General_CP1_CI_AI) AS ' + COLUMN_NAME
             WHEN DATA_TYPE IN('varchar', 'nvarchar') AND CHARACTER_MAXIMUM_LENGTH <> -1 THEN '((CAST(ISNULL(' + COLUMN_NAME + ','''') AS VARCHAR(' + CAST(CHARACTER_MAXIMUM_LENGTH AS VARCHAR) + ')) COLLATE Cyrillic_General_CI_AI) COLLATE SQL_Latin1_General_CP1_CI_AI) AS ' + COLUMN_NAME
             WHEN DATA_TYPE IN('char', 'nchar') THEN '(CAST(ISNULL(' + COLUMN_NAME + ','''') AS CHAR(' + CAST(CHARACTER_MAXIMUM_LENGTH AS VARCHAR) + '))  COLLATE Cyrillic_General_CI_AI) COLLATE SQL_Latin1_General_CP1_CI_AI AS ' + COLUMN_NAME
+            WHEN DATA_TYPE IN('tinyint') THEN 'CAST(' + COLUMN_NAME + ' AS SMALLINT) AS ' + COLUMN_NAME
             ELSE COLUMN_NAME END
             , ORDINAL_POSITION
             FROM INFORMATION_SCHEMA.COLUMNS
@@ -121,7 +124,7 @@ namespace sqltoaws
             string getDecNum = String.Format(@"SET NOCOUNT ON;
             SELECT COLUMN_NAME, NUMERIC_SCALE FROM INFORMATION_SCHEMA.COLUMNS WHERE DATA_TYPE IN ('numeric', 'decimal') AND TABLE_SCHEMA = '{0}' AND  TABLE_NAME = '{1}'", schemaName, tblName);
             string getSQL = String.Format(@"SET NOCOUNT ON;
-SELECT 'CREATE TABLE stage.{1} (' + STRING_AGG(LOWER(c.COLUMN_NAME) + ' ' +
+SELECT 'CREATE TABLE stage.{1} (' + STRING_AGG(CAST(LOWER(c.COLUMN_NAME) as VARCHAR(MAX)) + ' ' +
 CASE(c.DATA_TYPE)
 WHEN 'bit' THEN 'BOOLEAN'
 WHEN 'date' THEN 'DATE' 
@@ -231,11 +234,14 @@ WHERE c.TABLE_SCHEMA = '{0}' AND c.TABLE_NAME ='{1}';
                     case TypeCode.Boolean: columns[i] = new ParquetSharp.Column<bool?>(dt.Columns[i].ColumnName); break;
                     case TypeCode.Decimal:
                         {   
-                            scale = scales[dt.Columns[i].ColumnName];                         
+                            scale = scales[dt.Columns[i].ColumnName];
+                            //Console.WriteLine("PRECISION = {0} SCALE = {1}", precision, scale);                            
                             columns[i] = new ParquetSharp.Column<decimal?>(dt.Columns[i].ColumnName, LogicalType.Decimal(precision, scale)); break;
                         }
                     case TypeCode.Single: columns[i] = new ParquetSharp.Column<Single?>(dt.Columns[i].ColumnName); break;
-                    default: Console.WriteLine(dt.Columns[i].DataType.Name); break;
+                    case TypeCode.Double: columns[i] = new ParquetSharp.Column<double?>(dt.Columns[i].ColumnName); break;
+                    case TypeCode.Byte: columns[i] = new ParquetSharp.Column<Byte?>(dt.Columns[i].ColumnName); break;
+                    default: Console.WriteLine("{0}, {1}", dt.Columns[i], dt.Columns[i].DataType.Name); break;
                 }
             }
 
@@ -326,7 +332,27 @@ WHERE c.TABLE_SCHEMA = '{0}' AND c.TABLE_NAME ='{1}';
                             }
                             Array.Clear(singlArray, 0, singlArray.Length);
                             break;
-                        }                   
+                        }
+                    case TypeCode.Double:   
+                        {
+                            dblArray = dt.AsEnumerable().Select(d => d.Field<double?>(dt.Columns[i].ColumnName)).ToArray();
+                            using (var singlWriter = rowGroup.NextColumn().LogicalWriter<double?>())
+                            {
+                                singlWriter.WriteBatch(dblArray);
+                            }
+                            Array.Clear(dblArray, 0, dblArray.Length);
+                            break;
+                        }     
+                    case TypeCode.Byte:   
+                        {
+                            byteArray = dt.AsEnumerable().Select(d => d.Field<Byte?>(dt.Columns[i].ColumnName)).ToArray();
+                            using (var singlWriter = rowGroup.NextColumn().LogicalWriter<Byte?>())
+                            {
+                                singlWriter.WriteBatch(byteArray);
+                            }
+                            Array.Clear(byteArray, 0, byteArray.Length);
+                            break;
+                        }                                        
                 }
             }  //for  
             file.Close();
