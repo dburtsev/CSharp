@@ -1,17 +1,25 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using System.Net;
+using System.Net.Sockets;
+using System.IO;
 using System.Data;
 using System.Data.OleDb; // dotnet add package System.Data.OleDb --version 6.0.2-mauipre.1.22054.8
-using System.IO;
 using ParquetSharp; // dotnet add package ParquetSharp
 using ADODB; // dotnet add package ADODB --version 7.10.3077
-using Amazon; // dotnet add package AWSSDK.Core --version 3.7.6.2
+using Amazon; // dotnet add package AWSSDK.Core --version 3.7.13.3     3.7.6.2
 using Amazon.S3; // dotnet add package AWSSDK.S3 --version 3.7.7.17
 using Amazon.S3.Transfer;
+using Amazon.Glue; //dotnet add package AWSSDK.Glue --version 3.7.23.14
+using Amazon.Glue.Model;
+using Amazon.Util;
+using System.Text.Json;
 using System.Data.Odbc; // dotnet add package Microsoft.Windows.Compatibility --version 6.0.2-mauipre.1.22054.8
+//using Microsoft.PowerShell; // dotnet add package Microsoft.PowerShell.SDK --version 7.2.6
+//using System.Management.Automation; // dotnet add package System.Management.Automation --version 7.3.0-preview.7
 
 // launch.json "console": "integratedTerminal"
 
@@ -19,44 +27,184 @@ namespace sqltoaws
 {
     class Program
     {
-        static string MSSQLConnStr = "Provider=MSOLEDBSQL;Database=xyz;Trusted_Connection=yes;";
-        static string RedshiftConnStr = "DRIVER=Amazon Redshift (x64);Server=xyz.redshift.amazonaws.com;Database=xyz;UID=xyz;pwd=xyz;Port=5439";
+        static string MSSQLConnStr = "Provider=MSOLEDBSQL;UID={0};PWD={1};PacketSize=16384;APP=" + System.Diagnostics.Process.GetCurrentProcess().ProcessName; //32767 8192
+        static string RedshiftConnStr = "DRIVER=Amazon Redshift (x64);"; 
         static string bucketName = "";
         static string keyName = "";
         static string filePath = "";
         static string tblName = "";
         static string crtDestTbl = "";
         static string sqlDropDest = "";
-        static string accesskeyDest = "";
-        static string secretkeyDest = "";
-        static int recordset_cache = 60000; // this 'magic' number depends from your hardware/network
         private static readonly RegionEndpoint bucketRegion = RegionEndpoint.USEast1;
         private static IAmazonS3? s3Client;
         const int precision = 29; // .NET limitation
+        static string schemaNameSQL = "dbo";
+        static string schemaNameAWS = "dbo_dev";
+        static System.Data.OleDb.OleDbDataAdapter adapter = new System.Data.OleDb.OleDbDataAdapter();
+        static Recordset rs = new ADODB.Recordset();
+        static string ConnectionName = "";
+        static string IAMRole = "";
+        static string logFileName = System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName + ".txt";
 
         static void Main(string[] args)
         {
-            string? FullTableName;
-            Console.WriteLine("Version: {0}", Environment.Version.ToString());
-            Console.WriteLine("Enter full table name like dbo.tblName:");
-            FullTableName = Console.ReadLine();
+            bool allTables = false;
+            bool foundTable = false;
+            bool rslt = false;
+            int rowsNum = 0;
+            
+            string getTblsRowsCount = String.Format(@"SET NOCOUNT ON;
+SELECT SCHEMA_NAME(TBL.schema_id) AS SchemaName, TBL.name AS TableName, CAST(SUM(PART.rows) AS INT) AS RowCounts
+FROM sys.tables TBL
+INNER JOIN sys.partitions PART ON TBL.object_id = PART.object_id
+INNER JOIN sys.indexes IDX ON PART.object_id = IDX.object_id
+AND PART.index_id = IDX.index_id
+WHERE IDX.index_id < 2 AND TBL.name NOT IN('sysdiagrams') AND TBL.temporal_type != 1 AND TBL.name LIKE 't_%' AND SCHEMA_NAME(TBL.schema_id) = '{0}'
+GROUP BY TBL.schema_id, TBL.name
+ORDER BY TBL.schema_id, TBL.name DESC;", schemaNameSQL);
 
-            // do we have schema?
-            if (FullTableName.IndexOf('.') == -1 )
-            { FullTableName = String.Concat("dbo.", FullTableName); }
+            Console.WriteLine(DateTime.Now.ToString("MM/dd/yyyy HH:mm:ss") + " Start");
+            Console.WriteLine("Environment Version: {0}", Environment.Version.ToString());
+            Console.WriteLine("Log file: {0}", logFileName);
+            // delete log file if exist
+            System.IO.File.Delete(logFileName);
+            System.Data.DataTable dtTables = new System.Data.DataTable();
 
+            // Get IP address
+            IPAddress ipaddr = Dns.GetHostAddresses(Dns.GetHostName()).Where(address => address.AddressFamily == AddressFamily.InterNetwork).First();
+            string ip = ipaddr.ToString();
+            // Get Redshift connection name
+            if (ip.StartsWith("10.138.86")) {
+                ConnectionName = "mocsdw"; // dev
+            }
+            else if (ip.StartsWith("10.138.15")) {
+                ConnectionName = "mocsdw-pprod"; //pre-prod
+            }
+            else {
+                throw new Exception("Unknown IP " + ip);
+            }
+
+            //Console.WriteLine("We will read information from Glue connections buyer_nyc_prep3_HSM and " + ConnectionName);
+            // Get Role
+            string jsonString = Amazon.Util.EC2InstanceMetadata.GetData("/iam/info");
+            // Create a JsonNode DOM from a JSON string.
+            System.Text.Json.Nodes.JsonNode infoNode = System.Text.Json.Nodes.JsonNode.Parse(jsonString)!;
+            System.Text.Json.Nodes.JsonNode iamrolenode = infoNode!["InstanceProfileArn"]!;
+            IAMRole = iamrolenode.ToJsonString().Trim('"').Replace("instance-profile", "role");
+
+            //Console.WriteLine(IAMRole);
+            //Environment.Exit(0);
+
+            // Get Redshift connection strinng  // Data Catalog
+            Amazon.Glue.Model.Connection jdbcon = GetConnectionObj(ConnectionName);
+            //Console.WriteLine(string.Join(Environment.NewLine,jdbcon.ConnectionProperties));
+            string[] tmparr = (jdbcon.ConnectionProperties["JDBC_CONNECTION_URL"]).Split(":");
+            string RedshiftServer = tmparr[2].Remove(0,2);
+            //Console.WriteLine(RedshiftServer);
+            string RedshiftDB = ((tmparr[3]).Split("/"))[1];
+            //Console.WriteLine(RedshiftDB);
+            string RedshiftUID = jdbcon.ConnectionProperties["USERNAME"];
+            //Console.WriteLine(RedshiftUID);
+            string RedShiftPWD = jdbcon.ConnectionProperties["PASSWORD"];
+            //Console.WriteLine(RedShiftPWD);
+            string RedShiftPort = ((tmparr[3]).Split("/"))[0];
+            System.Data.Odbc.OdbcConnectionStringBuilder builder = new OdbcConnectionStringBuilder(RedshiftConnStr);
+            builder.Add("UID", RedshiftUID);
+            builder.Add("Database", RedshiftDB);
+            builder.Add("Server", RedshiftServer);
+            builder.Add("pwd", RedShiftPWD);
+            RedshiftConnStr = builder.ConnectionString;
+
+            ADODB.Connection objConnection = new ADODB.Connection();
+            ConnectionName = "buyer_nyc_prep3_HSM";
+            jdbcon = GetConnectionObj(ConnectionName);
+            //tmparr = (jdbcon.ConnectionProperties["JDBC_CONNECTION_URL"]).Split(":");
+            //Console.WriteLine(jdbcon.ConnectionProperties["JDBC_CONNECTION_URL"]);
+            //string SQLServer =  tmparr[2].Remove(0,2);
+            //Console.WriteLine(SQLServer); // 10.224.243.118\SQL2017
+            //Console.WriteLine(tmparr[3]); // 20170;database=buyer_nyc_prep3_HSM
+            string UID = jdbcon.ConnectionProperties["USERNAME"];
+            string PWD = jdbcon.ConnectionProperties["PASSWORD"];
+            MSSQLConnStr = String.Format(MSSQLConnStr, UID, PWD);
+            objConnection.ConnectionString = MSSQLConnStr;
+            //Console.WriteLine(objConnection.ConnectionString );
+            
+            objConnection.Open();
+            Console.WriteLine("Default MS SQL Server database is:" + objConnection.DefaultDatabase);
+            rs.Open(getTblsRowsCount, objConnection);
+            adapter.Fill(dtTables, rs);
+            rs.Close();
+            objConnection.Close();
+
+            Console.WriteLine("Enter full table name like dbo.tblName or press Enter to get all dbo tables:");
+            string? FullTableName = Console.ReadLine();
+
+            if (FullTableName == "") { // User press Enter
+                allTables = true;
+                foundTable = true;
+            }
+            else
+            {
+                allTables = false;
+                if (FullTableName.StartsWith("dbo.")) {
+                    tblName = FullTableName.Substring(4);
+                }
+                else
+                {
+                    tblName = FullTableName;
+                }
+            }
+            //Console.WriteLine("!allTables 1");
+            if (!allTables) {
+                //Console.WriteLine("!allTables 2");
+                Console.WriteLine(DateTime.Now.ToString("MM/dd/yyyy HH:mm:ss") + " Looking for " + tblName + " in " + dtTables.Rows.Count.ToString() + " tables");
+                foreach(DataRow row in dtTables.Rows) {
+                    int comparison = String.Compare(row["TableName"].ToString(), tblName, comparisonType: StringComparison.OrdinalIgnoreCase);
+                    // Console.WriteLine( comparison.ToString() + "  " + row["TableName"].ToString());
+                    if (comparison == 0) {
+                        foundTable = true;
+                        rowsNum = (int)row["RowCounts"];
+                        break;
+                    }
+                }
+            }
+
+            if (!foundTable) {
+                Console.WriteLine(DateTime.Now.ToString("MM/dd/yyyy HH:mm:ss") + " Table " + tblName + " not found!");
+                Environment.Exit(0);
+            }
             
             setVariables();
             s3Client = new AmazonS3Client(bucketRegion);
 
-            bool rslt = ProcessTable(FullTableName);
-            UploadFileAsync().Wait();
-            LoadToRedshift();
+            if(allTables) {
+                foreach(DataRow row in dtTables.Rows) {
+                    tblName = row["TableName"].ToString();
+                    rowsNum = (int)row["RowCounts"];
+                    Console.WriteLine(String.Format("Table {0}.{1} has {2} rows", schemaNameSQL, tblName, rowsNum));
+                    if(rowsNum > 0) {
+                        rslt = ProcessTable(schemaNameSQL + "." + tblName, rowsNum);
+                        UploadFileAsync().Wait();
+                        LoadToRedshift();
+                    }
+                }
+            }
+            else {
+                // do we have schema?
+                if (FullTableName.IndexOf('.') == -1 )
+                    { FullTableName = String.Concat("dbo.", FullTableName); }
+                Console.WriteLine(String.Format("Table {0}.{1} has {2} rows", schemaNameSQL, tblName, rowsNum)); 
+                if(rowsNum > 0) {   
+                    rslt = ProcessTable(FullTableName, rowsNum);
+                    UploadFileAsync().Wait();
+                    LoadToRedshift();
+                }
+            }            
 
-            Console.WriteLine("Press any key to close"); 
+            Console.WriteLine(DateTime.Now.ToString("MM/dd/yyyy HH:mm:ss") + " End. Press any key to close"); 
             Console.ReadKey();          
         } // static void Main
-        static bool ProcessTable(string? FullTableName)
+        static bool ProcessTable(string FullTableName, int rowsCount)
             {
             string selStr = "";
             
@@ -81,22 +229,27 @@ namespace sqltoaws
 
             // Get the current directory.
             string curr_path = Directory.GetCurrentDirectory();
-            //Console.WriteLine("The current directory is {0}", curr_path);
+            // Console.WriteLine("The current directory is {0}", curr_path);
             filePath = Path.Combine(curr_path, (tblName + ".parquet"));
             Console.WriteLine("The output file is {0}", filePath);
 
-            sqlDropDest = String.Format("DROP TABLE IF EXISTS stage.{0}", tblName);
+            sqlDropDest = String.Format("DROP TABLE IF EXISTS {0}.{1}", schemaNameAWS, tblName);
 
             string getSelect = String.Format(@"SET NOCOUNT ON; 
             WITH CTE (Clm, column_id) AS
             (
             SELECT CASE
-            WHEN DATA_TYPE IN('date', 'datetime', 'datetimeoffset') THEN 'CAST(' + COLUMN_NAME + ' AS DATETIME2) AS ' + COLUMN_NAME
-            WHEN DATA_TYPE IN('varchar', 'nvarchar', 'xml') AND (CHARACTER_MAXIMUM_LENGTH = -1 OR CHARACTER_MAXIMUM_LENGTH > 65535) THEN '((CAST(ISNULL(' + COLUMN_NAME + ','''') AS VARCHAR(65535))) COLLATE Cyrillic_General_CI_AI) COLLATE SQL_Latin1_General_CP1_CI_AI) AS ' + COLUMN_NAME
-            WHEN DATA_TYPE IN('varchar', 'nvarchar') AND CHARACTER_MAXIMUM_LENGTH <> -1 THEN '((CAST(ISNULL(' + COLUMN_NAME + ','''') AS VARCHAR(' + CAST(CHARACTER_MAXIMUM_LENGTH AS VARCHAR) + ')) COLLATE Cyrillic_General_CI_AI) COLLATE SQL_Latin1_General_CP1_CI_AI) AS ' + COLUMN_NAME
-            WHEN DATA_TYPE IN('char', 'nchar') THEN '(CAST(ISNULL(' + COLUMN_NAME + ','''') AS CHAR(' + CAST(CHARACTER_MAXIMUM_LENGTH AS VARCHAR) + '))  COLLATE Cyrillic_General_CI_AI) COLLATE SQL_Latin1_General_CP1_CI_AI AS ' + COLUMN_NAME
-            WHEN DATA_TYPE IN('tinyint') THEN 'CAST(' + COLUMN_NAME + ' AS SMALLINT) AS ' + COLUMN_NAME
-            ELSE COLUMN_NAME END
+            WHEN DATA_TYPE IN('date', 'datetime', 'datetimeoffset') THEN 'CAST([' + COLUMN_NAME + '] AS DATETIME2) AS [' + COLUMN_NAME + ']'
+            WHEN DATA_TYPE IN('varchar', 'nvarchar') AND (CHARACTER_MAXIMUM_LENGTH = -1 OR CHARACTER_MAXIMUM_LENGTH > 65535) THEN 'TRANSLATE(LEFT((((CAST(ISNULL([' + COLUMN_NAME + '],'''') AS VARCHAR(MAX))) COLLATE Cyrillic_General_CI_AI) COLLATE SQL_Latin1_General_Cp850_CI_AI),65535),CHAR(173) + CHAR(160) + ''§·©®¤«»¦°±'',''- S*CR """" o~'') AS [' + COLUMN_NAME + ']'
+            WHEN DATA_TYPE IN('varchar', 'nvarchar') AND CHARACTER_MAXIMUM_LENGTH <> -1 THEN 'TRANSLATE(((CAST(ISNULL([' + COLUMN_NAME + '],'''') AS VARCHAR(' + CAST(CHARACTER_MAXIMUM_LENGTH AS VARCHAR) + ')) COLLATE Cyrillic_General_CI_AI) COLLATE SQL_Latin1_General_Cp850_CI_AI),CHAR(173) + CHAR(160) + ''§·©®¤«»¦°±'',''- S*CR """" o~'') AS [' + COLUMN_NAME + ']'
+            WHEN DATA_TYPE IN('char', 'nchar') THEN '(CAST(ISNULL([' + COLUMN_NAME + '],'''') AS CHAR(' + CAST(CHARACTER_MAXIMUM_LENGTH AS VARCHAR) + ')) COLLATE Cyrillic_General_CI_AI) COLLATE SQL_Latin1_General_Cp850_CI_AI AS [' + COLUMN_NAME + ']'
+            WHEN DATA_TYPE IN('tinyint') THEN 'CAST([' + COLUMN_NAME + '] AS SMALLINT) AS [' + COLUMN_NAME + ']'
+            WHEN DATA_TYPE = 'uniqueidentifier' THEN 'CAST([' + COLUMN_NAME + '] AS CHAR(36)) AS [' + COLUMN_NAME + ']'
+            WHEN DATA_TYPE IN('varbinary','binary') THEN 'CAST(''binary'' AS CHAR(6)) AS [' + COLUMN_NAME + ']'
+            WHEN DATA_TYPE IN('timestamp','rowversion') THEN 'CAST([' + COLUMN_NAME + '] AS BIGINT) AS [' + COLUMN_NAME + ']'
+            WHEN DATA_TYPE = 'hierarchyid' THEN 'CAST([' + COLUMN_NAME + '] AS VARCHAR(4000)) AS [' + COLUMN_NAME + ']'
+            WHEN DATA_TYPE = 'xml' THEN 'TRANSLATE(LEFT((((CAST(ISNULL(CAST([' + COLUMN_NAME + '] AS NVARCHAR(MAX)),'''') AS VARCHAR(MAX))) COLLATE Cyrillic_General_CI_AI) COLLATE SQL_Latin1_General_Cp850_CI_AI),65535),CHAR(173) + CHAR(160) + ''§·©®¤«»¦°±'',''- S*CR """" o~'') AS [' + COLUMN_NAME + ']'
+            ELSE '[' + COLUMN_NAME + ']' END
             , ORDINAL_POSITION
             FROM INFORMATION_SCHEMA.COLUMNS
             WHERE TABLE_SCHEMA = '{0}' AND TABLE_NAME = '{1}'
@@ -106,25 +259,17 @@ namespace sqltoaws
             SELECT STRING_AGG(CAST(Clm AS VARCHAR(MAX)), ',')  WITHIN GROUP(ORDER BY column_id)  AS '---', 1
             FROM CTE
             UNION ALL
-            SELECT ' FROM {0}.{1};', 1025 AS column_id
-            ORDER BY 2;", schemaName, tblName);
-            string getTblRowsCount = String.Format(@"SET NOCOUNT ON;
-            SELECT CAST(p.rows AS INT) AS RowCounts
-            FROM sys.tables t 
-            INNER JOIN sys.indexes i ON t.OBJECT_ID = i.object_id
-            INNER JOIN sys.partitions p ON i.object_id = p.OBJECT_ID AND i.index_id = p.index_id
-            INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-            WHERE s.name = '{0}' AND t.name = '{1}' 
-            GROUP BY t.name, s.name, p.rows;", schemaName, tblName);
+            SELECT ' FROM {0}.{1} WITH (NOLOCK);', 1025 AS column_id
+            ORDER BY 2;", schemaNameSQL, tblName);
             // TRUE is converted to 1 and FALSE is converted to 0.
-            string chkIfTblExist = String.Format(@"SET NOCOUNT ON; IF (EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES 
-            WHERE TABLE_SCHEMA = '{0}' AND  TABLE_NAME = '{1}')) SELECT 1 ELSE SELECT 0;", schemaName, tblName);
+            // string chkIfTblExist = String.Format(@"SET NOCOUNT ON; IF (EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.TABLES 
+            // WHERE TABLE_SCHEMA = '{0}' AND  TABLE_NAME = '{1}')) SELECT 1 ELSE SELECT 0;", schemaNameAWS, tblName);
             // SQL server and Redshift maximum precision is 38.
             // .NET decimal represents decimal numbers ranging from positive 79,228,162,514,264,337,593,543,950,335 to negative 79,228,162,514,264,337,593,543,950,335. Maximum precision is 29.
             string getDecNum = String.Format(@"SET NOCOUNT ON;
             SELECT COLUMN_NAME, NUMERIC_SCALE FROM INFORMATION_SCHEMA.COLUMNS WHERE DATA_TYPE IN ('numeric', 'decimal') AND TABLE_SCHEMA = '{0}' AND  TABLE_NAME = '{1}'", schemaName, tblName);
             string getSQL = String.Format(@"SET NOCOUNT ON;
-SELECT 'CREATE TABLE stage.{1} (' + STRING_AGG(CAST(LOWER(c.COLUMN_NAME) as VARCHAR(MAX)) + ' ' +
+SELECT 'CREATE TABLE {0}.{2} (' + STRING_AGG(CAST(LOWER(QUOTENAME(c.COLUMN_NAME,CHAR(34))) as VARCHAR(MAX)) + ' ' +
 CASE(c.DATA_TYPE)
 WHEN 'bit' THEN 'BOOLEAN'
 WHEN 'date' THEN 'DATE' 
@@ -148,38 +293,33 @@ WHEN 'int' THEN 'INT'
 WHEN 'bigint' THEN 'INT8'
 WHEN 'uniqueidentifier' THEN 'CHAR(36)' 
 WHEN 'xml' THEN 'VARCHAR(65535)' 
+WHEN 'varbinary' THEN 'CHAR(6)'
+WHEN 'binary' THEN 'CHAR(6)'
+WHEN 'timestamp' THEN 'BIGINT'
+WHEN 'rowversion' THEN 'BIGINT'
+WHEN 'hierarchyid' THEN 'VARCHAR(4000)'
 ELSE c.DATA_TYPE END + 
 CASE WHEN c.IS_NULLABLE = 'NO' THEN ' NOT NULL ' ELSE '' END 
 ,',') + ')'
 FROM INFORMATION_SCHEMA.COLUMNS c
-WHERE c.TABLE_SCHEMA = '{0}' AND c.TABLE_NAME ='{1}';
-            ", schemaName, tblName);
+WHERE c.TABLE_SCHEMA = '{1}' AND c.TABLE_NAME ='{2}';
+            ", schemaNameAWS, schemaNameSQL,tblName);
 
-            Console.WriteLine("Start process for " + schemaName + "." + tblName);
+            Console.WriteLine(DateTime.Now.ToString("MM/dd/yyyy HH:mm:ss") + " Start process for " + schemaNameSQL + "." + tblName);
 
-            Connection objConnection = new ADODB.Connection();
+            ADODB.Connection objConnection = new ADODB.Connection();
             objConnection.ConnectionString = MSSQLConnStr;
+            objConnection.CommandTimeout = 0;
+            //objConnection.
             Recordset rs = new ADODB.Recordset();
+            //rs.CacheSize = ?;
             OleDbDataAdapter adapter = new System.Data.OleDb.OleDbDataAdapter();
             System.Data.DataTable dt = new System.Data.DataTable();
 
             objConnection.Open();
-            rs.Open(chkIfTblExist, objConnection);
-            int result = (int)rs.Fields[0].Value;
-            rs.Close();
-
-            if (result == 1)
-            {
-                Console.WriteLine("Found table " + schemaName + "." + tblName);
-            }
-            else
-            {
-                Console.WriteLine("Table " + schemaName + "." + tblName + " not found!");
-                Console.ReadKey();
-                System.Environment.Exit(1);
-            }
 
             // get CREATE TABLE 
+            File.AppendAllText(logFileName, (getSQL + Environment.NewLine));
             rs.Open(getSQL, objConnection);
             rs.MoveFirst();
             crtDestTbl = rs.Fields[0].Value.ToString();
@@ -196,11 +336,10 @@ WHERE c.TABLE_SCHEMA = '{0}' AND c.TABLE_NAME ='{1}';
             rs.Close();
             //Console.WriteLine(selStr);  
 
-            rs.Open(getTblRowsCount, objConnection);
+/*             rs.Open(getTblRowsCount, objConnection);
             if (rs.Fields[0].Value == null) { Console.WriteLine("Empty Recordset"); }
             int rowsCount = (int)rs.Fields[0].Value;
-            rs.Close();
-            Console.WriteLine(String.Format("Table {0}.{1} has {2} rows", schemaName, tblName, rowsCount));
+            rs.Close(); */
 
             rs.Open(getDecNum, objConnection);
             while (rs.EOF != true)
@@ -210,20 +349,63 @@ WHERE c.TABLE_SCHEMA = '{0}' AND c.TABLE_NAME ='{1}';
             }            
             rs.Close();
 
-            rs.Open(selStr, objConnection);
-            if (rs.CacheSize < recordset_cache) { rs.CacheSize = (int)rowsCount; }
-            else { rs.CacheSize = recordset_cache; }
+            File.AppendAllText(logFileName, (selStr + Environment.NewLine));
 
-            adapter.Fill(dt, rs);
+            rs.Open(selStr, objConnection);
+            // if (rs.CacheSize < recordset_cache) { rs.CacheSize = (int)rowsCount; }
+            // else { rs.CacheSize = recordset_cache; }
+            // if (rowsCount > recordset_cache) { rs.CacheSize = recordset_cache; }
+            // else { rs.CacheSize = rowsCount; }
+            rs.CacheSize = rowsCount;
+            dt.MinimumCapacity = rowsCount;
+ 
+            DateTime startDate = DateTime.Now;
+            for(int i = 0; i < 4; i++)
+            {
+                try
+                {
+                    dt.BeginLoadData();
+                    adapter.Fill(dt, rs);
+                }
+                catch (Exception e)
+                {
+                    File.AppendAllText(logFileName, ("Error in " + tblName + Environment.NewLine));
+                    File.AppendAllText(logFileName, ($"{e}"));
+                    Thread.Sleep(1000);
+                    if (i < 3)
+                    {
+                    if (objConnection.State != 1) { objConnection.Open(); } // 1 = Open
+                        continue;
+                    }
+                    else
+                    {
+                        throw;
+                    }
+                }
+                finally { dt.EndLoadData(); }
+            }
+            
+
+            //Console.WriteLine("MinimumCapacity is {0}, CacheSize is {1}",dt.MinimumCapacity,rs.CacheSize);
+
+            var diff = DateTime.Now.Subtract(startDate);
+            Console.WriteLine(String.Format(DateTime.Now.ToString("MM/dd/yyyy HH:mm:ss") + " Load DataTable in {0}:{1}:{2} and close connection to database", diff.Hours,diff.Minutes,diff.Seconds));
 
             rs.Close();
             rs = null;
             objConnection.Close();
+            objConnection = null;
+
+            //GC.Collect();
+            //GC.WaitForPendingFinalizers();
+            //Console.WriteLine(DateTime.Now.ToString("MM/dd/yyyy HH:mm:ss") + " done with garbage collector");
+            startDate = DateTime.Now;
 
             var columns = new ParquetSharp.Column[dt.Columns.Count];
 
             for (int i = 0; i < dt.Columns.Count; i++)
             {
+                //Console.WriteLine(" column {0} datatype {1} typecode {2}", dt.Columns[i].ColumnName, dt.Columns[i].DataType, Type.GetTypeCode(dt.Columns[i].DataType));
                 switch (System.Type.GetTypeCode(dt.Columns[i].DataType))
                 {
                     case TypeCode.Int16: columns[i] = new ParquetSharp.Column<Int16?>(dt.Columns[i].ColumnName); break;
@@ -241,7 +423,8 @@ WHERE c.TABLE_SCHEMA = '{0}' AND c.TABLE_NAME ='{1}';
                     case TypeCode.Single: columns[i] = new ParquetSharp.Column<Single?>(dt.Columns[i].ColumnName); break;
                     case TypeCode.Double: columns[i] = new ParquetSharp.Column<double?>(dt.Columns[i].ColumnName); break;
                     case TypeCode.Byte: columns[i] = new ParquetSharp.Column<Byte?>(dt.Columns[i].ColumnName); break;
-                    default: Console.WriteLine("{0}, {1}", dt.Columns[i], dt.Columns[i].DataType.Name); break;
+                    //case TypeCode.Object: columns[i] = new ParquetSharp.Column<ByteArray>(dt.Columns[i].ColumnName); break;
+                    default: Console.WriteLine("Missing column {0}, type {1}", dt.Columns[i], dt.Columns[i].DataType.Name); break;
                 }
             }
 
@@ -356,9 +539,8 @@ WHERE c.TABLE_SCHEMA = '{0}' AND c.TABLE_NAME ='{1}';
                 }
             }  //for  
             file.Close();
-            Console.WriteLine("saved to '{0}'",filePath);
-
-            Console.WriteLine("Done with " + FullTableName);
+            diff = DateTime.Now.Subtract(startDate);
+            Console.WriteLine(DateTime.Now.ToString("MM/dd/yyyy HH:mm:ss") + String.Format(" DataTable Columns to Parquet {3} in {0}:{1}:{2}", diff.Hours,diff.Minutes,diff.Seconds,filePath));
             return true;
             }  // static bool ProcessTable
         private static void setVariables()
@@ -376,17 +558,34 @@ WHERE c.TABLE_SCHEMA = '{0}' AND c.TABLE_NAME ='{1}';
             {
                 connDest.Open();
                 get_var_value.Connection = connDest;
-                get_var_value.Prepare();
-                get_var_value.Parameters["var_nm"].Value = "accesskey";
-                accesskeyDest = (string)get_var_value.ExecuteScalar();
-                Environment.SetEnvironmentVariable("AWS_ACCESS_KEY_ID", accesskeyDest, EnvironmentVariableTarget.Process);
-                get_var_value.Parameters["var_nm"].Value = "secretkey";
-                secretkeyDest = (string)get_var_value.ExecuteScalar();
-                Environment.SetEnvironmentVariable("AWS_SECRET_ACCESS_KEY",secretkeyDest, EnvironmentVariableTarget.Process);
                 get_var_value.Parameters["var_nm"].Value = "bucket";
                 bucketName = (string)get_var_value.ExecuteScalar();                
             }
         }
+        private static async Task<Amazon.Glue.Model.Connection> GetConnectionObjasync(string ConnName)
+        {
+            var client = new AmazonGlueClient();
+            var request = new GetConnectionRequest() { Name = ConnName };
+            var response = await client.GetConnectionAsync(request);
+            return response.Connection;
+        }
+        private static Amazon.Glue.Model.Connection GetConnectionObj(string ConnName)
+        {
+            var task = GetConnectionObjasync(ConnName);
+            task.Wait();
+            return task.Result;            
+        }
+        /* private static async Task<string> getStr(string ConnName)
+        {
+            await Task.Delay(1000);
+            return ConnName;
+        }
+        private static string getStr2()
+        {
+            var task = getStr("qwe");
+            task.Wait();
+            return task.Result;
+        } */
         private static async Task UploadFileAsync()
         {
             try
@@ -401,7 +600,7 @@ WHERE c.TABLE_SCHEMA = '{0}' AND c.TABLE_NAME ='{1}';
                 // Option 2. Specify object key name explicitly.
                 keyName = @"SQLTOAWS/" + Path.GetFileName(filePath);
                 await fileTransferUtility.UploadAsync(filePath, bucketName, keyName);
-                Console.WriteLine("Upload to s3 {0} is completed", keyName);
+                Console.WriteLine(DateTime.Now.ToString("MM/dd/yyyy HH:mm:ss") + " Upload to s3 {0} is completed", keyName);
 
                 // Option 3. Upload data from a type of System.IO.Stream.
                 // using (var fileToUpload = 
@@ -431,30 +630,38 @@ WHERE c.TABLE_SCHEMA = '{0}' AND c.TABLE_NAME ='{1}';
             catch (AmazonS3Exception e)
             {
                 Console.WriteLine("Error encountered on server. Message:'{0}' when writing an object", e.Message);
+                throw;
             }
             catch (Exception e)
             {
                 Console.WriteLine("Unknown encountered on server. Message:'{0}' when writing an object", e.Message);
+                throw;
             }
-
+        File.Delete(filePath);
         } // Task UploadFileAsync()
         static bool LoadToRedshift()
         {
-            Console.WriteLine("Start Redshift COPY command");
-            OdbcCommand commdest = new System.Data.Odbc.OdbcCommand();
+            Console.WriteLine(DateTime.Now.ToString("MM/dd/yyyy HH:mm:ss") + " Start Redshift COPY command");
+            
             using (OdbcConnection connDest = new OdbcConnection(RedshiftConnStr))
             {
                 connDest.Open();
-                commdest.Connection = connDest;
-                commdest.CommandText = sqlDropDest;
+                OdbcCommand commdest = new System.Data.Odbc.OdbcCommand(sqlDropDest, connDest);
                 commdest.ExecuteNonQuery(); // drop table
                 commdest.CommandText = crtDestTbl;
                 commdest.ExecuteNonQuery(); // create table
-                string copyCommand = String.Format(@"COPY stage.{0} FROM 's3://{1}/{2}' access_key_id '{3}' secret_access_key '{4}' PARQUET ", tblName, bucketName, keyName, accesskeyDest, secretkeyDest);
+                string copyCommand = String.Format(@"COPY {4}.{0} FROM 's3://{1}/{2}' IAM_ROLE '{3}' PARQUET ", tblName, bucketName, keyName, IAMRole, schemaNameAWS);
                 commdest.CommandText = copyCommand;
+                Console.WriteLine(copyCommand);
                 commdest.ExecuteNonQuery();
+                commdest.CommandText = "SELECT CAST(PG_LAST_COPY_COUNT() AS TEXT) AS pg_last_copy_count";
+                string rowsNumsStr = (commdest.ExecuteScalar()).ToString();
+                Console.WriteLine(DateTime.Now.ToString("MM/dd/yyyy HH:mm:ss") + " COPY command inserted {0} rows", rowsNumsStr);
             } // OdbcConnection
-            Console.WriteLine("Finished Redshift COPY command");
+            AmazonS3Client client = new AmazonS3Client();
+            //Amazon.S3.Model.DeleteObjectResponse resp = await client.DeleteObjectAsync(bucketName,keyName);
+            client.DeleteObjectAsync(bucketName,keyName);
+            //Console.WriteLine("Finished Redshift COPY command");
             return true;
         }
     } // class Program
