@@ -1,43 +1,34 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+using System;
 using System.Net;
 using System.Net.Sockets;
-using System.IO;
 using System.Data;
 using System.Data.OleDb; // dotnet add package System.Data.OleDb --version 6.0.2-mauipre.1.22054.8
-using ParquetSharp; // dotnet add package ParquetSharp
+using ParquetSharp; // dotnet add package ParquetSharp --version 18.1.0-beta1
 using ADODB; // dotnet add package ADODB --version 7.10.3077
 using Amazon; // dotnet add package AWSSDK.Core --version 3.7.13.3     3.7.6.2
 using Amazon.S3; // dotnet add package AWSSDK.S3 --version 3.7.7.17
 using Amazon.S3.Transfer;
 using Amazon.Glue; //dotnet add package AWSSDK.Glue --version 3.7.23.14
 using Amazon.Glue.Model;
-using Amazon.Util;
-using System.Text.Json;
-using System.Data.Odbc; // dotnet add package Microsoft.Windows.Compatibility --version 6.0.2-mauipre.1.22054.8
-//using Microsoft.PowerShell; // dotnet add package Microsoft.PowerShell.SDK --version 7.2.6
-//using System.Management.Automation; // dotnet add package System.Management.Automation --version 7.3.0-preview.7
-
-// launch.json "console": "integratedTerminal"
+using System.Data.Odbc; // dotnet add package Microsoft.Windows.Compatibility --version 8.0.4
 
 namespace sqltoaws
 {
     class Program
     {
-        static string MSSQLConnStr = "Provider=MSOLEDBSQL;UID={0};PWD={1};PacketSize=16384;APP=" + System.Diagnostics.Process.GetCurrentProcess().ProcessName; //32767 8192
-        static string RedshiftConnStr = "DRIVER=Amazon Redshift (x64);"; 
+        // The maximum network packet size for encrypted connections is 16,383 bytes.
+      
+        static string MSSQLConnStr = "Provider=MSOLEDBSQL;Server=...;Database=...;UID={0};PWD={1};ApplicationIntent=ReadOnly;...;PacketSize=16383;ConnectRetryCount=3;APP=" + System.Diagnostics.Process.GetCurrentProcess().ProcessName; 
+        static string RedshiftConnStr = "DRIVER=Amazon Redshift (x64);"; //Server=...";
         static string bucketName = "";
         static string keyName = "";
         static string filePath = "";
         static string tblName = "";
         static string crtDestTbl = "";
         static string sqlDropDest = "";
+        //static int recordset_cache = 60000; // this 'magic' number depends from your hardware/network
         private static readonly RegionEndpoint bucketRegion = RegionEndpoint.USEast1;
         private static IAmazonS3? s3Client;
-        const int precision = 29; // .NET limitation
         static string schemaNameSQL = "dbo";
         static string schemaNameAWS = "dbo_dev";
         static System.Data.OleDb.OleDbDataAdapter adapter = new System.Data.OleDb.OleDbDataAdapter();
@@ -59,7 +50,7 @@ FROM sys.tables TBL
 INNER JOIN sys.partitions PART ON TBL.object_id = PART.object_id
 INNER JOIN sys.indexes IDX ON PART.object_id = IDX.object_id
 AND PART.index_id = IDX.index_id
-WHERE IDX.index_id < 2 AND TBL.name NOT IN('sysdiagrams') AND TBL.temporal_type != 1 AND TBL.name LIKE 't_%' AND SCHEMA_NAME(TBL.schema_id) = '{0}'
+WHERE IDX.index_id < 2 AND TBL.name NOT IN('sysdiagrams','t_sup_prop_liens_') AND TBL.temporal_type != 1 AND TBL.name LIKE 't_%' AND SCHEMA_NAME(TBL.schema_id) = '{0}'
 GROUP BY TBL.schema_id, TBL.name
 ORDER BY TBL.schema_id, TBL.name DESC;", schemaNameSQL);
 
@@ -74,27 +65,22 @@ ORDER BY TBL.schema_id, TBL.name DESC;", schemaNameSQL);
             IPAddress ipaddr = Dns.GetHostAddresses(Dns.GetHostName()).Where(address => address.AddressFamily == AddressFamily.InterNetwork).First();
             string ip = ipaddr.ToString();
             // Get Redshift connection name
-            if (ip.StartsWith("10.138.86")) {
-                ConnectionName = "mocsdw"; // dev
+            if (ip.StartsWith("10...")) {
+                ConnectionName = "..."; // dev
             }
-            else if (ip.StartsWith("10.138.15")) {
-                ConnectionName = "mocsdw-pprod"; //pre-prod
+            else if (ip.StartsWith("10...")) {
+                ConnectionName = "...."; //pre-prod
             }
             else {
                 throw new Exception("Unknown IP " + ip);
             }
 
-            //Console.WriteLine("We will read information from Glue connections buyer_nyc_prep3_HSM and " + ConnectionName);
             // Get Role
             string jsonString = Amazon.Util.EC2InstanceMetadata.GetData("/iam/info");
             // Create a JsonNode DOM from a JSON string.
             System.Text.Json.Nodes.JsonNode infoNode = System.Text.Json.Nodes.JsonNode.Parse(jsonString)!;
             System.Text.Json.Nodes.JsonNode iamrolenode = infoNode!["InstanceProfileArn"]!;
             IAMRole = iamrolenode.ToJsonString().Trim('"').Replace("instance-profile", "role");
-
-            //Console.WriteLine(IAMRole);
-            //Environment.Exit(0);
-
             // Get Redshift connection strinng  // Data Catalog
             Amazon.Glue.Model.Connection jdbcon = GetConnectionObj(ConnectionName);
             //Console.WriteLine(string.Join(Environment.NewLine,jdbcon.ConnectionProperties));
@@ -118,11 +104,6 @@ ORDER BY TBL.schema_id, TBL.name DESC;", schemaNameSQL);
             ADODB.Connection objConnection = new ADODB.Connection();
             ConnectionName = "buyer_nyc_prep3_HSM";
             jdbcon = GetConnectionObj(ConnectionName);
-            //tmparr = (jdbcon.ConnectionProperties["JDBC_CONNECTION_URL"]).Split(":");
-            //Console.WriteLine(jdbcon.ConnectionProperties["JDBC_CONNECTION_URL"]);
-            //string SQLServer =  tmparr[2].Remove(0,2);
-            //Console.WriteLine(SQLServer); // 10.224.243.118\SQL2017
-            //Console.WriteLine(tmparr[3]); // 20170;database=buyer_nyc_prep3_HSM
             string UID = jdbcon.ConnectionProperties["USERNAME"];
             string PWD = jdbcon.ConnectionProperties["PASSWORD"];
             MSSQLConnStr = String.Format(MSSQLConnStr, UID, PWD);
@@ -138,6 +119,7 @@ ORDER BY TBL.schema_id, TBL.name DESC;", schemaNameSQL);
 
             Console.WriteLine("Enter full table name like dbo.tblName or press Enter to get all dbo tables:");
             string? FullTableName = Console.ReadLine();
+            // string? FullTableName = "...";
 
             if (FullTableName == "") { // User press Enter
                 allTables = true;
@@ -208,20 +190,22 @@ ORDER BY TBL.schema_id, TBL.name DESC;", schemaNameSQL);
             {
             string selStr = "";
             
-            int scale = 0;			
+            int scale = 0;
+            int precision = 0;
             string schemaName = "";
-            var num16Array = new Int16?[] { };
-            var numArray = new int?[] { };
-            var dtArray = new DateTime?[] { };
-            var strArray = new string?[] { };
-            var num64Array = new Int64?[] { };
-            var boolArray = new bool?[] { };
-            var charArray = new char?[] { };
-            var decArray = new decimal?[] { };
-            var dblArray = new double?[] { };
-            var singlArray = new Single?[] { };
-            var byteArray = new Byte?[] { };
+            short?[] num16Array = new Int16?[] { };
+            int?[] numArray = new int?[] { };
+            DateTime?[] dtArray = new DateTime?[] { };
+            string?[] strArray = new string?[] { };
+            long?[] num64Array = new Int64?[] { };
+            bool?[] boolArray = new bool?[] { };
+            char?[] charArray = new char?[] { };
+            decimal?[] decArray = new decimal?[] { };
+            double?[] dblArray = new double?[] { };
+            float?[] singlArray = new Single?[] { };
+            byte?[] byteArray = new Byte?[] { };
             Dictionary<string, int> scales = new Dictionary<string, int>();
+            Dictionary<string, int> precisions = new Dictionary<string, int>();
             //if (String.IsNullOrWhiteSpace(FullTableName)) { FullTableName = "dbo.new_line"; }
             int dotPos = FullTableName.IndexOf(".", 0, FullTableName.Length, StringComparison.CurrentCulture);
             schemaName = FullTableName.Substring(0, dotPos);
@@ -267,7 +251,7 @@ ORDER BY TBL.schema_id, TBL.name DESC;", schemaNameSQL);
             // SQL server and Redshift maximum precision is 38.
             // .NET decimal represents decimal numbers ranging from positive 79,228,162,514,264,337,593,543,950,335 to negative 79,228,162,514,264,337,593,543,950,335. Maximum precision is 29.
             string getDecNum = String.Format(@"SET NOCOUNT ON;
-            SELECT COLUMN_NAME, NUMERIC_SCALE FROM INFORMATION_SCHEMA.COLUMNS WHERE DATA_TYPE IN ('numeric', 'decimal') AND TABLE_SCHEMA = '{0}' AND  TABLE_NAME = '{1}'", schemaName, tblName);
+            SELECT COLUMN_NAME, CAST(NUMERIC_PRECISION AS INTEGER) AS NUMERIC_PRECISION, NUMERIC_SCALE FROM INFORMATION_SCHEMA.COLUMNS WHERE DATA_TYPE IN ('numeric', 'decimal') AND TABLE_SCHEMA = '{0}' AND  TABLE_NAME = '{1}'", schemaName, tblName);
             string getSQL = String.Format(@"SET NOCOUNT ON;
 SELECT 'CREATE TABLE {0}.{2} (' + STRING_AGG(CAST(LOWER(QUOTENAME(c.COLUMN_NAME,CHAR(34))) as VARCHAR(MAX)) + ' ' +
 CASE(c.DATA_TYPE)
@@ -280,10 +264,10 @@ WHEN 'smalldatetime' THEN 'TIMESTAMP'
 WHEN 'float' THEN 'FLOAT'
 WHEN 'nchar' THEN 'CHAR(' + CAST(c.CHARACTER_MAXIMUM_LENGTH AS VARCHAR) + ')' 
 WHEN 'char' THEN 'CHAR(' + CAST(c.CHARACTER_MAXIMUM_LENGTH AS VARCHAR) + ')' 
-/* WHEN 'decimal' THEN ('DECIMAL(' + CAST((COALESCE(c.NUMERIC_PRECISION, 0)) AS VARCHAR) + ',' + CAST((COALESCE(c.NUMERIC_SCALE, 0)) AS VARCHAR) + ')') 
-WHEN 'numeric' THEN ('NUMERIC(' + CAST((COALESCE(c.NUMERIC_PRECISION, 0)) AS VARCHAR) + ',' + CAST((COALESCE(c.NUMERIC_SCALE, 0)) AS VARCHAR) + ')') */
-WHEN 'decimal' THEN ('DECIMAL(29,' + CAST((COALESCE(c.NUMERIC_SCALE, 0)) AS VARCHAR) + ')') 
-WHEN 'numeric' THEN ('NUMERIC(29,' + CAST((COALESCE(c.NUMERIC_SCALE, 0)) AS VARCHAR) + ')') 
+WHEN 'decimal' THEN ('DECIMAL(' + CAST((COALESCE(c.NUMERIC_PRECISION, 0)) AS VARCHAR) + ',' + CAST((COALESCE(c.NUMERIC_SCALE, 0)) AS VARCHAR) + ')') 
+WHEN 'numeric' THEN ('NUMERIC(' + CAST((COALESCE(c.NUMERIC_PRECISION, 0)) AS VARCHAR) + ',' + CAST((COALESCE(c.NUMERIC_SCALE, 0)) AS VARCHAR) + ')') 
+/* WHEN 'decimal' THEN ('DECIMAL(29,' + CAST((COALESCE(c.NUMERIC_SCALE, 0)) AS VARCHAR) + ')') 
+WHEN 'numeric' THEN ('NUMERIC(29,' + CAST((COALESCE(c.NUMERIC_SCALE, 0)) AS VARCHAR) + ')') */
 WHEN 'nvarchar' THEN 'VARCHAR(' + CASE WHEN c.CHARACTER_MAXIMUM_LENGTH = -1 THEN '65535' ELSE CAST(c.CHARACTER_MAXIMUM_LENGTH AS VARCHAR) END + ')' 
 WHEN 'varchar' THEN 'VARCHAR(' + CASE WHEN c.CHARACTER_MAXIMUM_LENGTH = -1 THEN '65535' ELSE CAST(c.CHARACTER_MAXIMUM_LENGTH AS VARCHAR) END + ')' 
 WHEN 'real' THEN 'REAL' 
@@ -344,14 +328,15 @@ WHERE c.TABLE_SCHEMA = '{1}' AND c.TABLE_NAME ='{2}';
             rs.Open(getDecNum, objConnection);
             while (rs.EOF != true)
             {
-                scales.Add(rs.Fields[0].Value.ToString(), (int)rs.Fields[1].Value);
+                scales.Add(rs.Fields[0].Value.ToString(), (int)rs.Fields[2].Value);
+                precisions.Add(rs.Fields[0].Value.ToString(), (int)rs.Fields[1].Value);
                 rs.MoveNext();
             }            
             rs.Close();
 
             File.AppendAllText(logFileName, (selStr + Environment.NewLine));
 
-            rs.Open(selStr, objConnection);
+            rs.Open(selStr, objConnection, ADODB.CursorTypeEnum.adOpenForwardOnly, ADODB.LockTypeEnum.adLockReadOnly);
             // if (rs.CacheSize < recordset_cache) { rs.CacheSize = (int)rowsCount; }
             // else { rs.CacheSize = recordset_cache; }
             // if (rowsCount > recordset_cache) { rs.CacheSize = recordset_cache; }
@@ -384,11 +369,11 @@ WHERE c.TABLE_SCHEMA = '{1}' AND c.TABLE_NAME ='{2}';
                 }
                 finally { dt.EndLoadData(); }
             }
-            
+
 
             //Console.WriteLine("MinimumCapacity is {0}, CacheSize is {1}",dt.MinimumCapacity,rs.CacheSize);
 
-            var diff = DateTime.Now.Subtract(startDate);
+            TimeSpan diff = DateTime.Now.Subtract(startDate);
             Console.WriteLine(String.Format(DateTime.Now.ToString("MM/dd/yyyy HH:mm:ss") + " Load DataTable in {0}:{1}:{2} and close connection to database", diff.Hours,diff.Minutes,diff.Seconds));
 
             rs.Close();
@@ -401,7 +386,7 @@ WHERE c.TABLE_SCHEMA = '{1}' AND c.TABLE_NAME ='{2}';
             //Console.WriteLine(DateTime.Now.ToString("MM/dd/yyyy HH:mm:ss") + " done with garbage collector");
             startDate = DateTime.Now;
 
-            var columns = new ParquetSharp.Column[dt.Columns.Count];
+            ParquetSharp.Column[] columns = new ParquetSharp.Column[dt.Columns.Count];
 
             for (int i = 0; i < dt.Columns.Count; i++)
             {
@@ -417,7 +402,7 @@ WHERE c.TABLE_SCHEMA = '{1}' AND c.TABLE_NAME ='{2}';
                     case TypeCode.Decimal:
                         {   
                             scale = scales[dt.Columns[i].ColumnName];
-                            //Console.WriteLine("PRECISION = {0} SCALE = {1}", precision, scale);                            
+                            precision = precisions[dt.Columns[i].ColumnName];                          
                             columns[i] = new ParquetSharp.Column<decimal?>(dt.Columns[i].ColumnName, LogicalType.Decimal(precision, scale)); break;
                         }
                     case TypeCode.Single: columns[i] = new ParquetSharp.Column<Single?>(dt.Columns[i].ColumnName); break;
@@ -428,8 +413,9 @@ WHERE c.TABLE_SCHEMA = '{1}' AND c.TABLE_NAME ='{2}';
                 }
             }
 
-            using var file = new ParquetFileWriter(filePath, columns);
-            using var rowGroup = file.AppendRowGroup();
+            using ParquetFileWriter file = new ParquetFileWriter(filePath, columns);
+            using RowGroupWriter rowGroup = file.AppendRowGroup();
+            EnumerableRowCollection<DataRow> enumdt = dt.AsEnumerable();
 
             for (int i = 0; i < dt.Columns.Count; i++)
             {
@@ -437,8 +423,8 @@ WHERE c.TABLE_SCHEMA = '{1}' AND c.TABLE_NAME ='{2}';
                 {
                     case TypeCode.Int16:
                         {
-                            num16Array = dt.AsEnumerable().Select(d => d.Field<Int16?>(dt.Columns[i].ColumnName)).ToArray();
-                            using (var int16Writer = rowGroup.NextColumn().LogicalWriter<Int16?>())
+                            num16Array = enumdt.Select(d => d.Field<Int16?>(dt.Columns[i].ColumnName)).ToArray();
+                            using (LogicalColumnWriter<short?> int16Writer = rowGroup.NextColumn().LogicalWriter<Int16?>())
                             {
                                 int16Writer.WriteBatch(num16Array);
                             }
@@ -447,8 +433,8 @@ WHERE c.TABLE_SCHEMA = '{1}' AND c.TABLE_NAME ='{2}';
                         }
                     case TypeCode.Int32:
                         {
-                            numArray = dt.AsEnumerable().Select(d => d.Field<int?>(dt.Columns[i].ColumnName)).ToArray();
-                            using (var intWriter = rowGroup.NextColumn().LogicalWriter<int?>())
+                            numArray = enumdt.Select(d => d.Field<int?>(dt.Columns[i].ColumnName)).ToArray();
+                            using (LogicalColumnWriter<int?> intWriter = rowGroup.NextColumn().LogicalWriter<int?>())
                             {
                                 intWriter.WriteBatch(numArray);
                             }
@@ -457,8 +443,8 @@ WHERE c.TABLE_SCHEMA = '{1}' AND c.TABLE_NAME ='{2}';
                         }
                     case TypeCode.Int64:
                         {
-                            num64Array = dt.AsEnumerable().Select(d => d.Field<Int64?>(dt.Columns[i].ColumnName)).ToArray();
-                            using (var int64Writer = rowGroup.NextColumn().LogicalWriter<Int64?>())
+                            num64Array = enumdt.Select(d => d.Field<Int64?>(dt.Columns[i].ColumnName)).ToArray();
+                            using (LogicalColumnWriter<long?> int64Writer = rowGroup.NextColumn().LogicalWriter<Int64?>())
                             {
                                 int64Writer.WriteBatch(num64Array);
                             }
@@ -468,8 +454,8 @@ WHERE c.TABLE_SCHEMA = '{1}' AND c.TABLE_NAME ='{2}';
                     case TypeCode.DateTime:
                         {
 
-                            dtArray = dt.AsEnumerable().Select(d => d.Field<DateTime?>(dt.Columns[i].ColumnName)).ToArray();
-                            using (var timestampWriter = rowGroup.NextColumn().LogicalWriter<DateTime?>())
+                            dtArray = enumdt.Select(d => d.Field<DateTime?>(dt.Columns[i].ColumnName)).ToArray();
+                            using (LogicalColumnWriter<DateTime?> timestampWriter = rowGroup.NextColumn().LogicalWriter<DateTime?>())
                             {
                             timestampWriter.WriteBatch(dtArray);
                             }
@@ -478,8 +464,8 @@ WHERE c.TABLE_SCHEMA = '{1}' AND c.TABLE_NAME ='{2}';
                         }    
                     case TypeCode.String:
                         {
-                            strArray = dt.AsEnumerable().Select(d => d.Field<string?>(dt.Columns[i].ColumnName)).ToArray();
-                            using (var strWriter = rowGroup.NextColumn().LogicalWriter<string?>())
+                            strArray = enumdt.Select(d => d.Field<string?>(dt.Columns[i].ColumnName)).ToArray();
+                            using (LogicalColumnWriter<string?> strWriter = rowGroup.NextColumn().LogicalWriter<string?>())
                             {
                                 strWriter.WriteBatch(strArray);
                             }
@@ -488,8 +474,8 @@ WHERE c.TABLE_SCHEMA = '{1}' AND c.TABLE_NAME ='{2}';
                         }
                     case TypeCode.Boolean:
                         {
-                            boolArray = dt.AsEnumerable().Select(d => d.Field<bool?>(dt.Columns[i].ColumnName)).ToArray();
-                            using (var boolWriter = rowGroup.NextColumn().LogicalWriter<bool?>())
+                            boolArray = enumdt.Select(d => d.Field<bool?>(dt.Columns[i].ColumnName)).ToArray();
+                            using (LogicalColumnWriter<bool?> boolWriter = rowGroup.NextColumn().LogicalWriter<bool?>())
                             {
                                 boolWriter.WriteBatch(boolArray);
                             }
@@ -498,8 +484,8 @@ WHERE c.TABLE_SCHEMA = '{1}' AND c.TABLE_NAME ='{2}';
                         }
                     case TypeCode.Decimal:
                         {
-                            decArray = dt.AsEnumerable().Select(d => d.Field<decimal?>(dt.Columns[i].ColumnName)).ToArray();
-                            using (var decWriter = rowGroup.NextColumn().LogicalWriter<decimal?>())
+                            decArray = enumdt.Select(d => d.Field<decimal?>(dt.Columns[i].ColumnName)).ToArray();
+                            using (LogicalColumnWriter<decimal?> decWriter = rowGroup.NextColumn().LogicalWriter<decimal?>())
                             {
                                 decWriter.WriteBatch(decArray);
                             }
@@ -508,8 +494,8 @@ WHERE c.TABLE_SCHEMA = '{1}' AND c.TABLE_NAME ='{2}';
                         }
                     case TypeCode.Single:
                         {
-                            singlArray = dt.AsEnumerable().Select(d => d.Field<Single?>(dt.Columns[i].ColumnName)).ToArray();
-                            using (var singlWriter = rowGroup.NextColumn().LogicalWriter<Single?>())
+                            singlArray = enumdt.Select(d => d.Field<Single?>(dt.Columns[i].ColumnName)).ToArray();
+                            using (LogicalColumnWriter<float?> singlWriter = rowGroup.NextColumn().LogicalWriter<Single?>())
                             {
                                 singlWriter.WriteBatch(singlArray);
                             }
@@ -518,8 +504,8 @@ WHERE c.TABLE_SCHEMA = '{1}' AND c.TABLE_NAME ='{2}';
                         }
                     case TypeCode.Double:   
                         {
-                            dblArray = dt.AsEnumerable().Select(d => d.Field<double?>(dt.Columns[i].ColumnName)).ToArray();
-                            using (var singlWriter = rowGroup.NextColumn().LogicalWriter<double?>())
+                            dblArray = enumdt.Select(d => d.Field<double?>(dt.Columns[i].ColumnName)).ToArray();
+                            using (LogicalColumnWriter<double?> singlWriter = rowGroup.NextColumn().LogicalWriter<double?>())
                             {
                                 singlWriter.WriteBatch(dblArray);
                             }
@@ -528,8 +514,8 @@ WHERE c.TABLE_SCHEMA = '{1}' AND c.TABLE_NAME ='{2}';
                         }     
                     case TypeCode.Byte:   
                         {
-                            byteArray = dt.AsEnumerable().Select(d => d.Field<Byte?>(dt.Columns[i].ColumnName)).ToArray();
-                            using (var singlWriter = rowGroup.NextColumn().LogicalWriter<Byte?>())
+                            byteArray = enumdt.Select(d => d.Field<Byte?>(dt.Columns[i].ColumnName)).ToArray();
+                            using (LogicalColumnWriter<byte?> singlWriter = rowGroup.NextColumn().LogicalWriter<Byte?>())
                             {
                                 singlWriter.WriteBatch(byteArray);
                             }
@@ -564,33 +550,22 @@ WHERE c.TABLE_SCHEMA = '{1}' AND c.TABLE_NAME ='{2}';
         }
         private static async Task<Amazon.Glue.Model.Connection> GetConnectionObjasync(string ConnName)
         {
-            var client = new AmazonGlueClient();
-            var request = new GetConnectionRequest() { Name = ConnName };
-            var response = await client.GetConnectionAsync(request);
+            AmazonGlueClient client = new AmazonGlueClient();
+            GetConnectionRequest request = new GetConnectionRequest() { Name = ConnName };
+            GetConnectionResponse response = await client.GetConnectionAsync(request);
             return response.Connection;
         }
         private static Amazon.Glue.Model.Connection GetConnectionObj(string ConnName)
         {
-            var task = GetConnectionObjasync(ConnName);
+            Task<Amazon.Glue.Model.Connection> task = GetConnectionObjasync(ConnName);
             task.Wait();
             return task.Result;            
         }
-        /* private static async Task<string> getStr(string ConnName)
-        {
-            await Task.Delay(1000);
-            return ConnName;
-        }
-        private static string getStr2()
-        {
-            var task = getStr("qwe");
-            task.Wait();
-            return task.Result;
-        } */
         private static async Task UploadFileAsync()
         {
             try
             {
-                var fileTransferUtility =
+                TransferUtility fileTransferUtility =
                     new TransferUtility(s3Client);
 
                 // Option 1. Upload a file. The file name is used as the object key name.
@@ -659,7 +634,6 @@ WHERE c.TABLE_SCHEMA = '{1}' AND c.TABLE_NAME ='{2}';
                 Console.WriteLine(DateTime.Now.ToString("MM/dd/yyyy HH:mm:ss") + " COPY command inserted {0} rows", rowsNumsStr);
             } // OdbcConnection
             AmazonS3Client client = new AmazonS3Client();
-            //Amazon.S3.Model.DeleteObjectResponse resp = await client.DeleteObjectAsync(bucketName,keyName);
             client.DeleteObjectAsync(bucketName,keyName);
             //Console.WriteLine("Finished Redshift COPY command");
             return true;
